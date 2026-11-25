@@ -9,10 +9,13 @@ from typing import Optional
 
 import litellm
 from litellm import Cache
+from dotenv import load_dotenv
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
+
+load_dotenv(Path(__file__).resolve().parents[2] / ".env")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////data/app.db")
 MODEL = os.getenv("LLM_MODEL", "gemini/gemini-2.0-flash")

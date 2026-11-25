@@ -24,20 +24,15 @@ PowerShell:
 
 ```powershell
 Copy-Item .env.example .env
-# Set the following values in .env before starting the services.
+# Add two real provider keys to LLM_API_KEYS in .env.
 cd backend
 python -m pip install -r requirements-dev.txt
 $env:DATABASE_URL = "sqlite:///./app.db"
-$env:LLM_API_KEYS = "your-provider-key-1,your-provider-key-2"
-$env:ALLOWED_ORIGINS = "http://localhost:3000"
-$env:ENABLE_FAILURE_SIMULATION = "true"
-$env:LLM_CACHE_ENABLED = "true"
 uvicorn app.main:app --reload --port 8000
 
 # In a second terminal:
 cd frontend
 npm ci
-$env:VITE_API_URL = "http://localhost:8000"
 npm run dev -- --host 0.0.0.0 --port 3000
 ```
 
