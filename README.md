@@ -30,6 +30,8 @@ python -m pip install -r requirements-dev.txt
 $env:DATABASE_URL = "sqlite:///./app.db"
 $env:LLM_API_KEYS = "your-provider-key-1,your-provider-key-2"
 $env:ALLOWED_ORIGINS = "http://localhost:3000"
+$env:ENABLE_FAILURE_SIMULATION = "true"
+$env:LLM_CACHE_ENABLED = "true"
 uvicorn app.main:app --reload --port 8000
 
 # In a second terminal:
@@ -48,6 +50,8 @@ pip install -r backend/requirements.txt
 export DATABASE_URL=sqlite:////tmp/app.db
 export LLM_API_KEYS=your-provider-key-1,your-provider-key-2
 export ALLOWED_ORIGINS=http://localhost:3000
+export ENABLE_FAILURE_SIMULATION=true
+export LLM_CACHE_ENABLED=true
 uvicorn app.main:app --app-dir backend --reload --port 8000
 
 cd frontend
