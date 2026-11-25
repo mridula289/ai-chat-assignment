@@ -1,29 +1,24 @@
 import json
+import logging
 import os
 import sqlite3
 import time
-import threading
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+import litellm
+from litellm import Cache
 from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
 
-try:
-    import litellm
-    from litellm import Cache
-except Exception:
-    litellm = None
-    Cache = None
-
-
 DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:////data/app.db")
 MODEL = os.getenv("LLM_MODEL", "gemini/gemini-2.0-flash")
 CACHE_ENABLED = os.getenv("LLM_CACHE_ENABLED", "true").lower() == "true"
 SIMULATION_ENABLED = os.getenv("ENABLE_FAILURE_SIMULATION", "false").lower() == "true"
+logger = logging.getLogger(__name__)
 
 
 def db_path() -> str:
@@ -67,12 +62,8 @@ def initialize_db():
         )
 
 
-# litellm disk cache is process-local and shared by backend workers.
-if litellm is not None and CACHE_ENABLED:
-    try:
-        litellm.cache = Cache(type="local", disk_cache_dir="/data/litellm_cache")
-    except Exception:
-        pass
+if CACHE_ENABLED:
+    litellm.cache = Cache(type="local")
 
 
 def utc_now():
@@ -81,9 +72,6 @@ def utc_now():
 
 keys = [key.strip() for key in os.getenv("LLM_API_KEYS", "").split(",") if key.strip()]
 key_ids = [f"key_{i}" for i in range(1, len(keys) + 1)]
-response_cache = {}
-cache_lock = threading.Lock()
-initialize_db()
 
 
 class ChatRequest(BaseModel):
@@ -91,16 +79,18 @@ class ChatRequest(BaseModel):
     message: str = Field(min_length=1, max_length=4000)
     system_prompt: Optional[str] = None
 
-    @field_validator("session_id")
+    @field_validator("session_id", mode="before")
     @classmethod
     def session_not_blank(cls, value):
-        if not value.strip():
+        if not isinstance(value, str) or not value.strip():
             raise ValueError("session_id must not be blank")
-        return value
+        return value.strip()
 
-    @field_validator("message")
+    @field_validator("message", mode="before")
     @classmethod
     def message_trimmed(cls, value):
+        if not isinstance(value, str):
+            raise ValueError("message must be a string")
         value = value.strip()
         if not value:
             raise ValueError("message must not be blank")
@@ -114,7 +104,7 @@ class ChatRequest(BaseModel):
         return value.strip() if value and value.strip() else None
 
 
-app = FastAPI()
+app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
 origins = [item.strip() for item in os.getenv("ALLOWED_ORIGINS", "*").split(",") if item.strip()]
 app.add_middleware(
     CORSMiddleware,
@@ -129,46 +119,24 @@ async def http_exception_handler(request: Request, exc: HTTPException):
     return JSONResponse(status_code=exc.status_code, content={"detail": exc.detail})
 
 
+@app.exception_handler(Exception)
+async def unexpected_exception_handler(request: Request, exc: Exception):
+    logger.exception("Unhandled request error")
+    return JSONResponse(status_code=500, content={"detail": "internal server error"})
+
+
 @app.on_event("startup")
 def startup():
     initialize_db()
 
 
-@app.on_event("shutdown")
-def shutdown():
-    pass
-
-
 @app.get("/health")
 def health():
+    if len(keys) < 2:
+        raise HTTPException(status_code=503, detail="at least two LLM API keys must be configured")
     with connect() as db:
         db.execute("SELECT 1").fetchone()
     return {"status": "ok", "keys_configured": len(keys), "cache_enabled": CACHE_ENABLED}
-
-
-def estimate_tokens(text):
-    return max(1, (len(text) + 3) // 4)
-
-
-def cache_lookup(messages):
-    if not CACHE_ENABLED:
-        return None
-    cache_key = json.dumps({"model": MODEL, "messages": messages}, ensure_ascii=False, sort_keys=True)
-    with cache_lock:
-        return response_cache.get(cache_key)
-
-
-def cache_store(messages, reply, input_tokens, output_tokens):
-    if not CACHE_ENABLED:
-        return
-    cache_key = json.dumps({"model": MODEL, "messages": messages}, ensure_ascii=False, sort_keys=True)
-    with cache_lock:
-        response_cache[cache_key] = {
-            "reply": reply,
-            "input_tokens": int(input_tokens),
-            "output_tokens": int(output_tokens),
-        }
-
 
 def parse_failures(header):
     if not SIMULATION_ENABLED or not header:
@@ -206,33 +174,30 @@ def status_from_exception(exc):
     return 0
 
 
-def add_message(session_id, role, content, metadata=None):
+def save_conversation(session_id, system_prompt, user_message, reply, metadata):
     with connect() as db:
         db.execute(
+            "INSERT INTO sessions(session_id, system_prompt, created_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET system_prompt=excluded.system_prompt",
+            (session_id, system_prompt, utc_now()),
+        )
+        db.execute(
             "INSERT INTO messages(session_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
-            (session_id, role, content, json.dumps(metadata) if metadata else None, utc_now()),
+            (session_id, "user", user_message, None, utc_now()),
+        )
+        db.execute(
+            "INSERT INTO messages(session_id, role, content, metadata, created_at) VALUES (?, ?, ?, ?, ?)",
+            (session_id, "assistant", reply, json.dumps(metadata), utc_now()),
         )
 
 
 @app.post("/chat")
 def chat(body: ChatRequest, x_simulate_failure: Optional[str] = Header(default=None)):
-    system_prompt = body.system_prompt
     with connect() as db:
         session = db.execute("SELECT system_prompt FROM sessions WHERE session_id=?", (body.session_id,)).fetchone()
-        if system_prompt:
-            db.execute(
-                "INSERT INTO sessions(session_id, system_prompt, created_at) VALUES (?, ?, ?) "
-                "ON CONFLICT(session_id) DO UPDATE SET system_prompt=excluded.system_prompt",
-                (body.session_id, system_prompt, utc_now()),
-            )
-        elif session and session["system_prompt"]:
-            system_prompt = session["system_prompt"]
-        else:
-            system_prompt = "You are a helpful assistant."
-            db.execute(
-                "INSERT OR IGNORE INTO sessions(session_id, system_prompt, created_at) VALUES (?, ?, ?)",
-                (body.session_id, system_prompt, utc_now()),
-            )
+    system_prompt = body.system_prompt or (
+        session["system_prompt"] if session and session["system_prompt"] else "You are a helpful assistant."
+    )
 
     with connect() as db:
         rows = db.execute(
@@ -243,25 +208,6 @@ def chat(body: ChatRequest, x_simulate_failure: Optional[str] = Header(default=N
     messages = [{"role": "system", "content": system_prompt}, *history, {"role": "user", "content": body.message}]
 
     started = time.perf_counter()
-    cache_hit = cache_lookup(messages)
-    if cache_hit is not None:
-        reply = cache_hit["reply"]
-        input_tokens = cache_hit["input_tokens"]
-        output_tokens = cache_hit["output_tokens"]
-        latency = int((time.perf_counter() - started) * 1000)
-        metadata = {
-            "resolution_source": "LLM_CACHE",
-            "model": MODEL,
-            "latency_ms": latency,
-            "input_tokens": int(input_tokens),
-            "output_tokens": int(output_tokens),
-            "key_id": None,
-            "fallback_attempts": 0,
-        }
-        add_message(body.session_id, "user", body.message)
-        add_message(body.session_id, "assistant", reply, metadata)
-        return {"session_id": body.session_id, "reply": reply, "metadata": metadata}
-
     failures = parse_failures(x_simulate_failure)
     fallback_attempts = 0
     for index, key_id in enumerate(key_ids):
@@ -269,53 +215,45 @@ def chat(body: ChatRequest, x_simulate_failure: Optional[str] = Header(default=N
         if simulated:
             fallback_attempts += 1
             continue
-        if litellm is not None and "placeholder" not in keys[index].lower() and "demo" not in keys[index].lower():
-            try:
-                response = litellm.completion(
-                    model=MODEL,
-                    messages=messages,
-                    api_key=keys[index],
-                    cache={"s-max-age": 86400},
-                )
-                reply = response.choices[0].message.content.strip()
-                usage = getattr(response, "usage", None)
-                input_tokens = getattr(usage, "prompt_tokens", None) if usage else sum(estimate_tokens(m["content"]) for m in messages)
-                output_tokens = getattr(usage, "completion_tokens", None) if usage else estimate_tokens(reply)
-                break
-            except Exception as exc:
-                status = status_from_exception(exc)
-                if status in {429, 500, 502, 503}:
-                    fallback_attempts += 1
-                    continue
-                fallback_attempts += 1
-                continue
-        else:
-            lower = body.message.lower()
-            if "capital of france" in lower:
-                reply = "The capital of France is Paris."
-            elif "capital" in lower:
-                reply = "A capital is the primary seat of government for a country or region."
-            else:
-                reply = f"I understand you said: {body.message}"
-            input_tokens = sum(estimate_tokens(m["content"]) for m in messages)
-            output_tokens = estimate_tokens(reply)
+        try:
+            response = litellm.completion(
+                model=MODEL,
+                messages=messages,
+                api_key=keys[index],
+                caching=CACHE_ENABLED,
+            )
+            reply = response.choices[0].message.content
+            usage = getattr(response, "usage", None)
+            input_tokens = getattr(usage, "prompt_tokens", None) if usage else None
+            output_tokens = getattr(usage, "completion_tokens", None) if usage else None
+            if not isinstance(reply, str) or not reply.strip():
+                raise ValueError("provider returned an empty reply")
+            if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+                raise ValueError("provider returned no token usage")
+            cache_hit = bool((getattr(response, "_hidden_params", {}) or {}).get("cache_hit"))
             break
+        except Exception as exc:
+            status = status_from_exception(exc)
+            logger.warning("LLM provider attempt failed: key_id=%s status=%s", key_id, status)
+            fallback_attempts += 1
+            if status not in {0, 401, 403, 429, 500, 502, 503}:
+                raise HTTPException(status_code=502, detail="provider request failed") from exc
     else:
         raise HTTPException(status_code=503, detail="all providers unavailable")
 
-    latency = max(1, int((time.perf_counter() - started) * 1000))
+    cache_hit = bool((getattr(response, "_hidden_params", {}) or {}).get("cache_hit"))
+    latency = int((time.perf_counter() - started) * 1000)
     metadata = {
-        "resolution_source": "LIVE_INFERENCE",
+        "resolution_source": "LLM_CACHE" if cache_hit else "LIVE_INFERENCE",
         "model": MODEL,
         "latency_ms": latency,
         "input_tokens": int(input_tokens),
         "output_tokens": int(output_tokens),
-        "key_id": key_id,
-        "fallback_attempts": fallback_attempts,
+        "key_id": None if cache_hit else key_id,
+        "fallback_attempts": 0 if cache_hit else fallback_attempts,
     }
-    cache_store(messages, reply, input_tokens, output_tokens)
-    add_message(body.session_id, "user", body.message)
-    add_message(body.session_id, "assistant", reply, metadata)
+    reply = reply.strip()
+    save_conversation(body.session_id, system_prompt, body.message, reply, metadata)
     return {"session_id": body.session_id, "reply": reply, "metadata": metadata}
 
 

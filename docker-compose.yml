@@ -3,7 +3,7 @@ services:
     build:
       context: ./backend
     environment:
-      LLM_API_KEYS: ${LLM_API_KEYS:-sk-placeholder-key-1,sk-placeholder-key-2}
+      LLM_API_KEYS: ${LLM_API_KEYS:?Set two real provider keys in .env}
       LLM_MODEL: ${LLM_MODEL:-gemini/gemini-2.0-flash}
       DATABASE_URL: ${DATABASE_URL:-sqlite:////data/app.db}
       ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
